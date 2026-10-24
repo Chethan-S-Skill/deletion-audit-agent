@@ -1,0 +1,6 @@
+pandas
+anthropic
+python-dotenv
+PyPDF2
+Pillow
+pytesseract

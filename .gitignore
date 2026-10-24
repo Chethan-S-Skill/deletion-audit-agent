@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.zip
+temp_repo/
+.claude/
