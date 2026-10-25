@@ -1,11 +1,47 @@
 """
-Advanced Audit Agent - Sophisticated rule-based deletion audit system
-Designed to impress PhD-level judges with comprehensive analysis
+Audit Agent - Core Privacy Compliance Decision Engine
+Determines deletion status (COMPLETE, INCOMPLETE, NOT_APPLICABLE) based on verified empirical evidence
+and constructs canonically-ordered remediation/verification plans per the problem specification.
 """
-import os
 import json
 import pandas as pd
-from datetime import datetime
+
+FINDING_OPS = {
+    'REPORT_REMAINING_RECORD': 1,
+    'REPORT_EXPOSED_PII': 2,
+    'REPORT_ACTIVE_DATA_FLOW': 3,
+    'REPORT_RESTORE_RISK': 4
+}
+REMEDIATION_OPS = {
+    'DISABLE_DATA_FLOW': 1,
+    'BLOCK_RESTORE': 2,
+    'DELETE_RECORD': 3,
+    'REDACT_RECORD': 4,
+    'ANONYMIZE_RECORD': 5
+}
+VERIFICATION_OPS = {
+    'VERIFY_RECORD_ABSENT': 1,
+    'VERIFY_RECORD_PRESENT': 2,
+    'VERIFY_RECORD_REDACTED': 3,
+    'VERIFY_RECORD_ANONYMIZED': 4,
+    'VERIFY_DATA_FLOW_DISABLED': 5,
+    'VERIFY_RESTORE_BLOCKED': 6
+}
+PHASE_RANKS = {'FINDING': 1, 'REMEDIATION': 2, 'VERIFICATION': 3}
+
+NOT_APP_PHRASES = [
+    'leave the account active',
+    'not asking for deletion',
+    'keep the account as it is',
+    'do not close the account',
+    'without removing any of my records',
+    'marketing lists only',
+    'not a request to erase',
+    'leave my profile and purchase history in place',
+    'continue using the service',
+    "don't delete or change anything",
+    'do not delete'
+]
 
 class AuditAgent:
     def __init__(self, deletion_rules_df, system_activity_df, identity_resolver, evidence_analyzer):
@@ -13,492 +49,236 @@ class AuditAgent:
         self.system_activity = system_activity_df
         self.identity_resolver = identity_resolver
         self.evidence_analyzer = evidence_analyzer
-        self.step_counter = 0
+
+    def is_not_applicable(self, request_text):
+        """Check if request is not an actual account deletion request (e.g. marketing opt-out, data export)"""
+        t = str(request_text).lower()
+        return any(p in t for p in NOT_APP_PHRASES)
+
+    def sort_steps(self, steps):
+        """Sort steps canonically by phase, operation rank, system_id, and resource_id"""
+        def sort_key(s):
+            p_rank = PHASE_RANKS.get(s['phase'], 99)
+            op = s['operation']
+            if s['phase'] == 'FINDING':
+                op_rank = FINDING_OPS.get(op, 99)
+            elif s['phase'] == 'REMEDIATION':
+                op_rank = REMEDIATION_OPS.get(op, 99)
+            else:
+                op_rank = VERIFICATION_OPS.get(op, 99)
+            return (p_rank, op_rank, s['system_id'], s['resource_id'])
+
+        sorted_steps = sorted(steps, key=sort_key)
+        for i, s in enumerate(sorted_steps, 1):
+            s['step_no'] = i
+        return sorted_steps
 
     def audit_deletion(self, deletion_request):
         """
-        Comprehensive audit function using multi-phase analysis:
-        1. Identity resolution across all systems
-        2. Evidence correlation and discovery
-        3. Temporal analysis of deletion operations
-        4. Risk assessment for backup/restore scenarios
-        5. Compliance verification against deletion rules
+        Audit a deletion request:
+        1. Check for non-deletion intent (NOT_APPLICABLE)
+        2. Resolve all user identities across time
+        3. Match against latest empirical evidence snapshot at/before audit timestamp
+        4. Detect findings vs verified states
+        5. Generate sorted canonical steps
         """
-        case_id = deletion_request['case_id']
+        cid = deletion_request['case_id']
         email = deletion_request['email']
-        audit_timestamp = deletion_request['audit_at']
-        reported_status = deletion_request.get('reported_status', 'UNKNOWN')
+        req_text = deletion_request.get('request_text', '')
+        audit_at_str = deletion_request['audit_at']
+        audit_dt = pd.to_datetime(audit_at_str, utc=True)
 
-        # Phase 1: Identity Resolution
-        user_id = self.identity_resolver.get_user_id_from_email(email)
-
-        # Check if user exists
-        if user_id is None or not self.identity_resolver.user_exists(user_id):
+        # 1. Check NOT_APPLICABLE
+        if self.is_not_applicable(req_text):
             return {
-                'case_id': case_id,
+                'case_id': cid,
                 'deletion_status': 'NOT_APPLICABLE',
                 'steps_json': '[]'
             }
 
-        # Resolve all identities (current + historical)
-        identities = self.identity_resolver.resolve_all_identities(user_id, audit_timestamp)
+        # 2. Multi-hop Identity Resolution
+        u_info = self.identity_resolver.resolve_all_identities(email, audit_timestamp=audit_at_str)
+        user_keys = {k.lower() for k in u_info['all_keys'] if k}
 
-        # Phase 2: Evidence Discovery
-        evidence_found = self.evidence_analyzer.get_evidence_for_identities(identities)
+        # 3. Evidence Snapshot Retrieval
+        selected_fid, obs_for_user = self.evidence_analyzer.find_observations_for_user(user_keys, audit_dt)
 
-        # Phase 3: System Activity Analysis
-        deletion_ops = self.get_deletion_operations(user_id, audit_timestamp)
+        # 4. Findings vs Verifications
+        findings = []
+        verifications = []
 
-        # Phase 4: Risk Assessment
-        restore_risks = self.check_restore_risks(user_id, audit_timestamp)
-        backup_risks = self.analyze_backup_integrity(user_id, audit_timestamp)
+        for obs in obs_for_user:
+            st = obs['state_type']
+            sys_id = obs['system_id']
+            rid = obs['resource_id']
+            fid = obs['evidence_id']
 
-        # Phase 5: Compliance Check
-        retention_requirements = self.check_retention_requirements(user_id)
+            if st == 'REMAINING_RECORD':
+                findings.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'finding_op': 'REPORT_REMAINING_RECORD',
+                    'rem_op': 'DELETE_RECORD',
+                    'ver_op': 'VERIFY_RECORD_ABSENT',
+                    'state': 'PRESENT',
+                    'rem_state': 'ABSENT',
+                    'evidence_id': fid
+                })
+            elif st == 'EXPOSED_PII_ANALYTICS':
+                findings.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'finding_op': 'REPORT_EXPOSED_PII',
+                    'rem_op': 'ANONYMIZE_RECORD',
+                    'ver_op': 'VERIFY_RECORD_ANONYMIZED',
+                    'state': 'PRESENT',
+                    'rem_state': 'ANONYMIZED',
+                    'evidence_id': fid
+                })
+            elif st in ['EXPOSED_PII_SUPPORT', 'EXPOSED_PII_TOMBSTONE']:
+                findings.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'finding_op': 'REPORT_EXPOSED_PII',
+                    'rem_op': 'REDACT_RECORD',
+                    'ver_op': 'VERIFY_RECORD_REDACTED',
+                    'state': 'PRESENT',
+                    'rem_state': 'REDACTED',
+                    'evidence_id': fid
+                })
+            elif st == 'ACTIVE_DATA_FLOW':
+                findings.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'finding_op': 'REPORT_ACTIVE_DATA_FLOW',
+                    'rem_op': 'DISABLE_DATA_FLOW',
+                    'ver_op': 'VERIFY_DATA_FLOW_DISABLED',
+                    'state': 'ACTIVE',
+                    'rem_state': 'DISABLED',
+                    'evidence_id': fid
+                })
+            elif st == 'RESTORE_RISK':
+                findings.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'finding_op': 'REPORT_RESTORE_RISK',
+                    'rem_op': 'BLOCK_RESTORE',
+                    'ver_op': 'VERIFY_RESTORE_BLOCKED',
+                    'state': 'ACTIVE',
+                    'rem_state': 'BLOCKED',
+                    'evidence_id': fid
+                })
+            elif st == 'VERIFY_ABSENT':
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_RECORD_ABSENT',
+                    'state': 'ABSENT',
+                    'evidence_id': fid
+                })
+            elif st == 'VERIFY_PRESENT':
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_RECORD_PRESENT',
+                    'state': 'PRESENT',
+                    'evidence_id': fid
+                })
+            elif st == 'VERIFY_ANONYMIZED':
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_RECORD_ANONYMIZED',
+                    'state': 'ANONYMIZED',
+                    'evidence_id': fid
+                })
+            elif st in ['VERIFY_REDACTED', 'VERIFY_TOMBSTONE_REDACTED']:
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_RECORD_REDACTED',
+                    'state': 'REDACTED',
+                    'evidence_id': fid
+                })
+            elif st == 'VERIFY_DATA_FLOW_DISABLED':
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_DATA_FLOW_DISABLED',
+                    'state': 'DISABLED',
+                    'evidence_id': fid
+                })
+            elif st == 'VERIFY_RESTORE_BLOCKED':
+                verifications.append({
+                    'system_id': sys_id,
+                    'resource_id': rid,
+                    'operation': 'VERIFY_RESTORE_BLOCKED',
+                    'state': 'BLOCKED',
+                    'evidence_id': fid
+                })
 
-        # Phase 6: Determine Final Status
-        status, steps = self.determine_status_and_steps(
-            case_id, user_id, identities, evidence_found,
-            deletion_ops, restore_risks, backup_risks,
-            retention_requirements, reported_status, audit_timestamp
-        )
+        is_incomplete = len(findings) > 0
+        final_steps = []
 
-        return {
-            'case_id': case_id,
-            'deletion_status': status,
-            'steps_json': json.dumps(steps)
-        }
-
-    def determine_status_and_steps(self, case_id, user_id, identities, evidence_found,
-                                   deletion_ops, restore_risks, backup_risks,
-                                   retention_requirements, reported_status, audit_timestamp):
-        """
-        Sophisticated decision engine for determining deletion status
-
-        Key insight: Evidence files are AUDIT SNAPSHOTS that can show either:
-        - Proper deletion state (ABSENT/ANONYMIZED/REDACTED) → COMPLETE
-        - Remaining/exposed data (PRESENT) → INCOMPLETE
-        """
-        self.step_counter = 0
-        steps = []
-
-        # Analyze evidence to determine if it shows proper deletion or remaining data
-        evidence_shows_complete_deletion = self._evidence_confirms_deletion(
-            evidence_found, deletion_ops, reported_status
-        )
-        evidence_shows_remaining_data = len(evidence_found) > 0 and not evidence_shows_complete_deletion
-
-        has_deletion_operations = len(deletion_ops) > 0
-        has_restore_risks = len(restore_risks) > 0 or len(backup_risks) > 0
-
-        # Decision tree for status determination
-        if evidence_shows_complete_deletion:
-            # COMPLETE: Evidence confirms deletion was done properly
-            status = 'COMPLETE'
-            steps = self.generate_complete_verification_steps(
-                user_id, identities, evidence_found, retention_requirements
-            )
-        elif evidence_shows_remaining_data or has_restore_risks:
-            # INCOMPLETE: Data still exists, or risks present
+        if is_incomplete:
             status = 'INCOMPLETE'
-            steps = self.generate_incomplete_remediation_steps(
-                user_id, identities, evidence_found, restore_risks,
-                backup_risks, retention_requirements
-            )
-        elif not evidence_found and not has_deletion_operations:
-            # No evidence, no operations - user may never have had data
-            status = 'NOT_APPLICABLE'
-            steps = []
-        elif not evidence_found and has_deletion_operations and not has_restore_risks:
-            # No evidence but deletions occurred - assume complete
-            status = 'COMPLETE'
-            steps = self.generate_minimal_verification_steps(user_id)
+            # 1. FINDING phase steps (with evidence_id)
+            for f in findings:
+                final_steps.append({
+                    'phase': 'FINDING',
+                    'system_id': f['system_id'],
+                    'resource_id': f['resource_id'],
+                    'operation': f['finding_op'],
+                    'state': f['state'],
+                    'evidence_id': f['evidence_id']
+                })
+            # 2. REMEDIATION phase steps (proposed remediation, evidence_id = "")
+            for f in findings:
+                final_steps.append({
+                    'phase': 'REMEDIATION',
+                    'system_id': f['system_id'],
+                    'resource_id': f['resource_id'],
+                    'operation': f['rem_op'],
+                    'state': f['rem_state'],
+                    'evidence_id': ""
+                })
+            # 3. VERIFICATION phase steps (future verification plan, evidence_id = "")
+            # Verified clean systems
+            for v in verifications:
+                final_steps.append({
+                    'phase': 'VERIFICATION',
+                    'system_id': v['system_id'],
+                    'resource_id': v['resource_id'],
+                    'operation': v['operation'],
+                    'state': v['state'],
+                    'evidence_id': ""
+                })
+            # Remediated systems
+            for f in findings:
+                final_steps.append({
+                    'phase': 'VERIFICATION',
+                    'system_id': f['system_id'],
+                    'resource_id': f['resource_id'],
+                    'operation': f['ver_op'],
+                    'state': f['rem_state'],
+                    'evidence_id': ""
+                })
         else:
-            # Default to INCOMPLETE for safety
-            status = 'INCOMPLETE'
-            steps = self.generate_minimal_remediation_steps(user_id)
+            status = 'COMPLETE'
+            # Only VERIFICATION phase steps with evidence_id
+            for v in verifications:
+                final_steps.append({
+                    'phase': 'VERIFICATION',
+                    'system_id': v['system_id'],
+                    'resource_id': v['resource_id'],
+                    'operation': v['operation'],
+                    'state': v['state'],
+                    'evidence_id': v['evidence_id']
+                })
 
-        return status, steps
-
-    def _evidence_confirms_deletion(self, evidence_found, deletion_ops, reported_status):
-        """
-        Determine if evidence confirms proper deletion vs showing remaining data
-
-        Primary heuristic: Use reported_status as the authoritative signal
-        - COMPLETE → evidence is verification of successful deletion
-        - NOT_STARTED/PARTIALLY_COMPLETE → evidence shows remaining data
-        """
-        # Primary signal: reported_status
-        if reported_status == 'COMPLETE':
-            return True
-
-        # Secondary signals for cases without clear reporting
-        if not evidence_found:
-            return False
-
-        # If we have successful deletion operations, might be complete
-        successful_deletions = [op for op in deletion_ops if op.get('reported_result') == 'SUCCESS']
-        if len(successful_deletions) >= 3:  # Multiple successful deletions
-            return True
-
-        # Default: evidence shows remaining data
-        return False
-
-    def generate_complete_verification_steps(self, user_id, identities, evidence_found, retention_requirements):
-        """Generate verification steps for COMPLETE deletions"""
-        steps = []
-        self.step_counter = 0
-
-        # Get primary evidence_id (use first evidence or default)
-        primary_evidence = evidence_found[0]['evidence_id'] if evidence_found else self._get_evidence_id_for_system('account_service')
-
-        # Verify main account deletion
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'VERIFY_RECORD_ABSENT',
-            'state': 'ABSENT',
-            'evidence_id': primary_evidence
-        })
-
-        # Verify security audit records are retained (compliance requirement)
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'security_service',
-            'resource_id': f'audit_record_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'VERIFY_RECORD_PRESENT',
-            'state': 'PRESENT',
-            'evidence_id': primary_evidence
-        })
-
-        # Verify analytics data is anonymized (not deleted)
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'analytics_platform',
-            'resource_id': f'analytics_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'VERIFY_RECORD_ANONYMIZED',
-            'state': 'ANONYMIZED',
-            'evidence_id': primary_evidence
-        })
-
-        return steps
-
-    def generate_minimal_verification_steps(self, user_id):
-        """Generate minimal verification for edge cases"""
-        steps = []
-        self.step_counter = 0
-
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'VERIFY_RECORD_ABSENT',
-            'state': 'ABSENT',
-            'evidence_id': ''
-        })
-
-        return steps
-
-    def generate_minimal_remediation_steps(self, user_id):
-        """Generate minimal remediation for edge cases"""
-        steps = []
-        self.step_counter = 0
-
-        # Finding
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'FINDING',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'REPORT_REMAINING_RECORD',
-            'state': 'PRESENT',
-            'evidence_id': ''
-        })
-
-        # Remediation
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'REMEDIATION',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'DELETE_RECORD',
-            'state': 'ABSENT',
-            'evidence_id': ''
-        })
-
-        # Verification
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
-            'operation': 'VERIFY_RECORD_ABSENT',
-            'state': 'ABSENT',
-            'evidence_id': ''
-        })
-
-        return steps
-
-    def generate_incomplete_remediation_steps(self, user_id, identities, evidence_found,
-                                             restore_risks, backup_risks, retention_requirements):
-        """Generate comprehensive remediation plan for INCOMPLETE deletions"""
-        steps = []
-        self.step_counter = 0
-
-        # Phase 1: FINDING - Report all remaining records
-        for evidence in evidence_found[:10]:  # Limit to top 10 for clarity
-            self.step_counter += 1
-            system_id = self.evidence_analyzer.get_system_from_evidence(evidence['evidence_id'])
-            resource_id = self.evidence_analyzer.get_resource_from_evidence(evidence['evidence_id'])
-
-            # Determine if it's PII or just a record
-            operation = 'REPORT_EXPOSED_PII' if 'email' in evidence.get('matched_term', '') or 'phone' in evidence.get('matched_term', '') else 'REPORT_REMAINING_RECORD'
-
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'FINDING',
-                'system_id': system_id,
-                'resource_id': resource_id,
-                'operation': operation,
-                'state': 'PRESENT',
-                'evidence_id': evidence['evidence_id']
-            })
-
-        # Phase 1b: Report active data flows (if evidence suggests ongoing sync)
-        if len(evidence_found) > 5:  # Multiple systems have data
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'FINDING',
-                'system_id': 'integration_service',
-                'resource_id': f'data_flow_{user_id.split("_")[-1]}',
-                'operation': 'REPORT_ACTIVE_DATA_FLOW',
-                'state': 'ACTIVE',
-                'evidence_id': ''
-            })
-
-        # Phase 1c: Report restore risks
-        for risk in restore_risks[:3]:  # Top 3 risks
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'FINDING',
-                'system_id': risk['system_id'],
-                'resource_id': risk['resource_id'],
-                'operation': 'REPORT_RESTORE_RISK',
-                'state': 'ACTIVE',
-                'evidence_id': ''
-            })
-
-        # Phase 2: REMEDIATION - Disable data flows first
-        if len(evidence_found) > 5:
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'REMEDIATION',
-                'system_id': 'integration_service',
-                'resource_id': f'data_flow_{user_id.split("_")[-1]}',
-                'operation': 'DISABLE_DATA_FLOW',
-                'state': 'DISABLED',
-                'evidence_id': ''
-            })
-
-        # Phase 2b: Delete/Redact/Anonymize based on system type
-        for evidence in evidence_found[:10]:
-            self.step_counter += 1
-            system_id = self.evidence_analyzer.get_system_from_evidence(evidence['evidence_id'])
-            resource_id = self.evidence_analyzer.get_resource_from_evidence(evidence['evidence_id'])
-
-            # Determine appropriate operation based on system
-            if 'analytics' in system_id or 'analytics' in resource_id:
-                operation = 'ANONYMIZE_RECORD'
-                state = 'ANONYMIZED'
-            elif 'support' in system_id or 'support' in resource_id:
-                operation = 'REDACT_RECORD'
-                state = 'REDACTED'
-            else:
-                operation = 'DELETE_RECORD'
-                state = 'ABSENT'
-
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'REMEDIATION',
-                'system_id': system_id,
-                'resource_id': resource_id,
-                'operation': operation,
-                'state': state,
-                'evidence_id': ''
-            })
-
-        # Phase 2c: Block restores
-        for risk in restore_risks[:3]:
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'REMEDIATION',
-                'system_id': risk['system_id'],
-                'resource_id': risk['resource_id'],
-                'operation': 'BLOCK_RESTORE',
-                'state': 'BLOCKED',
-                'evidence_id': ''
-            })
-
-        # Phase 3: VERIFICATION - Verify all remediations
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1]}',
-            'operation': 'VERIFY_RECORD_ABSENT',
-            'state': 'ABSENT',
-            'evidence_id': ''
-        })
-
-        # Verify each system where evidence was found
-        systems_found = set([self.evidence_analyzer.get_system_from_evidence(e['evidence_id']) for e in evidence_found[:10]])
-        for system_id in list(systems_found)[:5]:  # Top 5 systems
-            self.step_counter += 1
-
-            # Determine verification operation based on system
-            if 'analytics' in system_id:
-                operation = 'VERIFY_RECORD_ANONYMIZED'
-                state = 'ANONYMIZED'
-            elif 'support' in system_id:
-                operation = 'VERIFY_RECORD_REDACTED'
-                state = 'REDACTED'
-            else:
-                operation = 'VERIFY_RECORD_ABSENT'
-                state = 'ABSENT'
-
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'VERIFICATION',
-                'system_id': system_id,
-                'resource_id': f'{system_id}_data',
-                'operation': operation,
-                'state': state,
-                'evidence_id': ''
-            })
-
-        # Always verify security audit logs are present (compliance)
-        self.step_counter += 1
-        steps.append({
-            'step_no': self.step_counter,
-            'phase': 'VERIFICATION',
-            'system_id': 'security_service',
-            'resource_id': f'audit_record_{user_id.split("_")[-1]}',
-            'operation': 'VERIFY_RECORD_PRESENT',
-            'state': 'PRESENT',
-            'evidence_id': ''
-        })
-
-        # Verify data flows disabled
-        if len(evidence_found) > 5:
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'VERIFICATION',
-                'system_id': 'integration_service',
-                'resource_id': f'data_flow_{user_id.split("_")[-1]}',
-                'operation': 'VERIFY_DATA_FLOW_DISABLED',
-                'state': 'DISABLED',
-                'evidence_id': ''
-            })
-
-        # Verify restores blocked
-        for risk in restore_risks[:3]:
-            self.step_counter += 1
-            steps.append({
-                'step_no': self.step_counter,
-                'phase': 'VERIFICATION',
-                'system_id': risk['system_id'],
-                'resource_id': risk['resource_id'],
-                'operation': 'VERIFY_RESTORE_BLOCKED',
-                'state': 'BLOCKED',
-                'evidence_id': ''
-            })
-
-        return steps
-
-    def get_deletion_operations(self, user_id, audit_timestamp):
-        """Get all deletion operations for this user"""
-        ops = self.system_activity[
-            (self.system_activity['event_type'].str.contains('DELETE', na=False)) &
-            (pd.to_datetime(self.system_activity['event_time'], utc=True) <= pd.to_datetime(audit_timestamp, utc=True))
-        ]
-        return ops.to_dict('records')
-
-    def check_restore_risks(self, user_id, audit_timestamp):
-        """Check if there are backup/restore operations that could bring data back"""
-        risks = []
-
-        # Check for RESTORE operations after deletions
-        restores = self.system_activity[
-            (self.system_activity['event_type'].str.contains('RESTORE', na=False)) &
-            (pd.to_datetime(self.system_activity['event_time'], utc=True) <= pd.to_datetime(audit_timestamp, utc=True))
-        ]
-
-        for _, restore in restores.iterrows():
-            risks.append({
-                'system_id': restore.get('source_system', 'backup_service'),
-                'resource_id': restore.get('resource_id', f'backup_{len(risks)}'),
-                'operation': 'RESTORE',
-                'timestamp': str(restore['event_time'])
-            })
-
-        return risks[:3]  # Top 3 risks
-
-    def analyze_backup_integrity(self, user_id, audit_timestamp):
-        """Analyze backup operations that might contain user data"""
-        risks = []
-
-        # Check for RETAIN operations (archival/backup)
-        retains = self.system_activity[
-            (self.system_activity['event_type'].str.contains('RETAIN', na=False)) &
-            (pd.to_datetime(self.system_activity['event_time'], utc=True) <= pd.to_datetime(audit_timestamp, utc=True))
-        ]
-
-        for _, retain in retains.iterrows():
-            risks.append({
-                'system_id': retain.get('target_system', 'archive_service'),
-                'resource_id': retain.get('resource_id', f'archive_{len(risks)}'),
-                'operation': 'BACKUP',
-                'timestamp': str(retain['event_time'])
-            })
-
-        return risks[:2]  # Top 2 backup risks
-
-    def check_retention_requirements(self, user_id):
-        """Check which data must be retained for legal/compliance reasons"""
-        # Security audit logs must always be retained
-        requirements = {
-            'security_audit': True,
-            'financial_records': False,  # Would check based on rules
-            'legal_holds': False
+        sorted_res = self.sort_steps(final_steps)
+        return {
+            'case_id': cid,
+            'deletion_status': status,
+            'steps_json': json.dumps(sorted_res)
         }
-        return requirements
-
-    def _get_evidence_id_for_system(self, system_id):
-        """Get an appropriate evidence_id for a given system (for COMPLETE cases)"""
-        # Map common systems to evidence patterns
-        evidence_mapping = {
-            'account_service': 'evidence_54',
-            'security_service': 'evidence_92',
-            'analytics_platform': 'evidence_56',
-            'search_service': 'evidence_03',
-            'support_platform': 'evidence_01'
-        }
-        return evidence_mapping.get(system_id, 'evidence_92')
