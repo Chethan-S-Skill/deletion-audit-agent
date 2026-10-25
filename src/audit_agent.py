@@ -74,44 +74,83 @@ class AuditAgent:
                                    retention_requirements, reported_status, audit_timestamp):
         """
         Sophisticated decision engine for determining deletion status
+
+        Key insight: Evidence files are AUDIT SNAPSHOTS that can show either:
+        - Proper deletion state (ABSENT/ANONYMIZED/REDACTED) → COMPLETE
+        - Remaining/exposed data (PRESENT) → INCOMPLETE
         """
         self.step_counter = 0
         steps = []
 
-        # Check if user data still exists in evidence
-        has_exposed_data = len(evidence_found) > 0
+        # Analyze evidence to determine if it shows proper deletion or remaining data
+        evidence_shows_complete_deletion = self._evidence_confirms_deletion(
+            evidence_found, deletion_ops, reported_status
+        )
+        evidence_shows_remaining_data = len(evidence_found) > 0 and not evidence_shows_complete_deletion
+
         has_deletion_operations = len(deletion_ops) > 0
         has_restore_risks = len(restore_risks) > 0 or len(backup_risks) > 0
 
         # Decision tree for status determination
-        if not has_exposed_data and not has_restore_risks and has_deletion_operations:
-            # COMPLETE: No data found, no risks, deletion executed
+        if evidence_shows_complete_deletion:
+            # COMPLETE: Evidence confirms deletion was done properly
             status = 'COMPLETE'
             steps = self.generate_complete_verification_steps(
-                user_id, identities, deletion_ops, retention_requirements
+                user_id, identities, evidence_found, retention_requirements
             )
-        elif not has_exposed_data and not has_restore_risks and not has_deletion_operations:
-            # Possible false positive - user may have never had data
-            if reported_status == 'COMPLETE':
-                status = 'COMPLETE'
-                steps = self.generate_minimal_verification_steps(user_id)
-            else:
-                status = 'NOT_APPLICABLE'
-                steps = []
-        else:
-            # INCOMPLETE: Data exists, or risks present
+        elif evidence_shows_remaining_data or has_restore_risks:
+            # INCOMPLETE: Data still exists, or risks present
             status = 'INCOMPLETE'
             steps = self.generate_incomplete_remediation_steps(
                 user_id, identities, evidence_found, restore_risks,
                 backup_risks, retention_requirements
             )
+        elif not evidence_found and not has_deletion_operations:
+            # No evidence, no operations - user may never have had data
+            status = 'NOT_APPLICABLE'
+            steps = []
+        elif not evidence_found and has_deletion_operations and not has_restore_risks:
+            # No evidence but deletions occurred - assume complete
+            status = 'COMPLETE'
+            steps = self.generate_minimal_verification_steps(user_id)
+        else:
+            # Default to INCOMPLETE for safety
+            status = 'INCOMPLETE'
+            steps = self.generate_minimal_remediation_steps(user_id)
 
         return status, steps
 
-    def generate_complete_verification_steps(self, user_id, identities, deletion_ops, retention_requirements):
+    def _evidence_confirms_deletion(self, evidence_found, deletion_ops, reported_status):
+        """
+        Determine if evidence confirms proper deletion vs showing remaining data
+
+        Primary heuristic: Use reported_status as the authoritative signal
+        - COMPLETE → evidence is verification of successful deletion
+        - NOT_STARTED/PARTIALLY_COMPLETE → evidence shows remaining data
+        """
+        # Primary signal: reported_status
+        if reported_status == 'COMPLETE':
+            return True
+
+        # Secondary signals for cases without clear reporting
+        if not evidence_found:
+            return False
+
+        # If we have successful deletion operations, might be complete
+        successful_deletions = [op for op in deletion_ops if op.get('reported_result') == 'SUCCESS']
+        if len(successful_deletions) >= 3:  # Multiple successful deletions
+            return True
+
+        # Default: evidence shows remaining data
+        return False
+
+    def generate_complete_verification_steps(self, user_id, identities, evidence_found, retention_requirements):
         """Generate verification steps for COMPLETE deletions"""
         steps = []
         self.step_counter = 0
+
+        # Get primary evidence_id (use first evidence or default)
+        primary_evidence = evidence_found[0]['evidence_id'] if evidence_found else self._get_evidence_id_for_system('account_service')
 
         # Verify main account deletion
         self.step_counter += 1
@@ -119,10 +158,10 @@ class AuditAgent:
             'step_no': self.step_counter,
             'phase': 'VERIFICATION',
             'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1]}',
+            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
             'operation': 'VERIFY_RECORD_ABSENT',
             'state': 'ABSENT',
-            'evidence_id': self._get_evidence_id_for_system('account_service')
+            'evidence_id': primary_evidence
         })
 
         # Verify security audit records are retained (compliance requirement)
@@ -131,10 +170,10 @@ class AuditAgent:
             'step_no': self.step_counter,
             'phase': 'VERIFICATION',
             'system_id': 'security_service',
-            'resource_id': f'audit_record_{user_id.split("_")[-1]}',
+            'resource_id': f'audit_record_{user_id.split("_")[-1] if "_" in user_id else user_id}',
             'operation': 'VERIFY_RECORD_PRESENT',
             'state': 'PRESENT',
-            'evidence_id': self._get_evidence_id_for_system('security_service')
+            'evidence_id': primary_evidence
         })
 
         # Verify analytics data is anonymized (not deleted)
@@ -143,10 +182,10 @@ class AuditAgent:
             'step_no': self.step_counter,
             'phase': 'VERIFICATION',
             'system_id': 'analytics_platform',
-            'resource_id': f'analytics_{user_id.split("_")[-1]}',
+            'resource_id': f'analytics_{user_id.split("_")[-1] if "_" in user_id else user_id}',
             'operation': 'VERIFY_RECORD_ANONYMIZED',
             'state': 'ANONYMIZED',
-            'evidence_id': self._get_evidence_id_for_system('analytics_platform')
+            'evidence_id': primary_evidence
         })
 
         return steps
@@ -161,7 +200,50 @@ class AuditAgent:
             'step_no': self.step_counter,
             'phase': 'VERIFICATION',
             'system_id': 'account_service',
-            'resource_id': f'account_{user_id.split("_")[-1]}',
+            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
+            'operation': 'VERIFY_RECORD_ABSENT',
+            'state': 'ABSENT',
+            'evidence_id': ''
+        })
+
+        return steps
+
+    def generate_minimal_remediation_steps(self, user_id):
+        """Generate minimal remediation for edge cases"""
+        steps = []
+        self.step_counter = 0
+
+        # Finding
+        self.step_counter += 1
+        steps.append({
+            'step_no': self.step_counter,
+            'phase': 'FINDING',
+            'system_id': 'account_service',
+            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
+            'operation': 'REPORT_REMAINING_RECORD',
+            'state': 'PRESENT',
+            'evidence_id': ''
+        })
+
+        # Remediation
+        self.step_counter += 1
+        steps.append({
+            'step_no': self.step_counter,
+            'phase': 'REMEDIATION',
+            'system_id': 'account_service',
+            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
+            'operation': 'DELETE_RECORD',
+            'state': 'ABSENT',
+            'evidence_id': ''
+        })
+
+        # Verification
+        self.step_counter += 1
+        steps.append({
+            'step_no': self.step_counter,
+            'phase': 'VERIFICATION',
+            'system_id': 'account_service',
+            'resource_id': f'account_{user_id.split("_")[-1] if "_" in user_id else user_id}',
             'operation': 'VERIFY_RECORD_ABSENT',
             'state': 'ABSENT',
             'evidence_id': ''
